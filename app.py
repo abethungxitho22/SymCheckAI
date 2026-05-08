@@ -1,34 +1,46 @@
 """
 SymCheck AI - Medical Triage System
-Base backend with user auth
+Enhanced with user demographics and better emergency detection
 """
 
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, session
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
-import os
 import json
+import uuid
+import requests
+import re
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
+app.config['SECRET_KEY'] = 'dev-secret-key-change-in-production'
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///symcheck.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
-login_manager.login_message = 'Please log in to access your medical history.'
+
+# Ollama configuration
+OLLAMA_URL = "http://localhost:11434/api/generate"
+MODEL_NAME = "llama3.2:1b"
+CONFIDENCE_THRESHOLD = 85
+
+active_sessions = {}
 
 # ================================================================
-# DATABASE MODELS
+# DATABASE MODELS - UPDATED with user demographics
 # ================================================================
 
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(200), nullable=False)
+    first_name = db.Column(db.String(50))
+    last_name = db.Column(db.String(50))
+    age = db.Column(db.Integer)
+    gender = db.Column(db.String(20))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     medical_histories = db.relationship('MedicalHistory', backref='user', lazy=True)
 
@@ -37,19 +49,228 @@ class MedicalHistory(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     session_id = db.Column(db.String(100), nullable=False)
     symptoms = db.Column(db.Text, nullable=False)
-    conversation = db.Column(db.Text)  # JSON
-    final_conditions = db.Column(db.Text)  # JSON
+    conversation = db.Column(db.Text)
+    final_conditions = db.Column(db.Text)
     urgency = db.Column(db.String(50))
     confidence = db.Column(db.Float)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 # ================================================================
-# AUTHENTICATION ROUTES
+# EMERGENCY KEYWORDS - Comprehensive list
+# ================================================================
+
+EMERGENCY_CONDITIONS = {
+    "stroke": {
+        "keywords": ["stroke", "face drooping", "arm weakness", "slurred speech", "sudden confusion", 
+                    "trouble speaking", "sudden numbness", "face numb", "arm numb", "leg numb", 
+                    "sudden vision", "trouble walking", "loss of balance", "severe headache sudden"],
+        "diagnosis": "Possible Stroke - MEDICAL EMERGENCY",
+        "actions": ["CALL 911 IMMEDIATELY", "Note the time symptoms started", "Do not drive", "Do not eat or drink"],
+        "urgency": "EMERGENCY"
+    },
+    "heart_attack": {
+        "keywords": ["chest pain", "chest pressure", "heart attack", "chest tightness", "pain spreading to arm",
+                    "pain in jaw", "pain in back", "shortness of breath", "cold sweat", "nausea chest pain",
+                    "indigestion chest", "lightheaded", "pain left arm", "pain right arm"],
+        "diagnosis": "Possible Heart Attack - MEDICAL EMERGENCY",
+        "actions": ["CALL 911 IMMEDIATELY", "Chew aspirin if not allergic", "Stop all activity", "Unlock door for paramedics"],
+        "urgency": "EMERGENCY"
+    }
+}
+
+def check_emergency(symptoms_text):
+    """Check if symptoms indicate an emergency"""
+    symptoms_lower = symptoms_text.lower()
+    
+    for condition, data in EMERGENCY_CONDITIONS.items():
+        for keyword in data["keywords"]:
+            if keyword in symptoms_lower:
+                return {
+                    "is_emergency": True,
+                    "diagnosis": data["diagnosis"],
+                    "actions": data["actions"],
+                    "urgency": "EMERGENCY"
+                }
+    return {"is_emergency": False}
+
+# ================================================================
+# LLM FUNCTIONS
+# ================================================================
+
+def call_ollama(prompt):
+    """Simple call to Ollama"""
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": MODEL_NAME,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,
+                    "num_predict": 500
+                }
+            },
+            timeout=60
+        )
+        
+        if response.status_code == 200:
+            return response.json().get('response', '')
+        else:
+            print(f"Ollama error: {response.status_code}")
+            return None
+    except Exception as e:
+        print(f"Connection error: {e}")
+        return None
+
+def analyze_symptoms(session_data, user_message):
+    """Analyze symptoms using LLM with proper conversation tracking"""
+    
+    # Build conversation history
+    conversation_text = ""
+    for msg in session_data['conversation'][-8:]:
+        conversation_text += f"{msg['role']}: {msg['content']}\n"
+    
+    symptoms = session_data.get('symptoms', user_message)
+    if not session_data.get('symptoms'):
+        session_data['symptoms'] = user_message
+    
+    # Track what we've already asked
+    questions_asked = session_data.get('questions_asked', [])
+    exchange_count = len([m for m in session_data['conversation'] if m['role'] == 'user'])
+    
+    # Check if we already have a diagnosis in progress
+    if exchange_count < 2:
+        # Early stage - need more info
+        followup_prompt = f"""The patient has these symptoms: {symptoms}
+
+You act as a doctor. Your role play starts as soon as you reply. You are responsible for as successfully diagnosing this problem.
+Get this one hint, plus another, so think of question to get as much info as possible.  
+
+Ask ONE specific follow-up question to understand better. Ask about:
+- When symptoms started (sudden or gradual)
+- Severity on scale 1-10
+- What makes it better or worse
+- Location and radiation of symptoms
+
+Just ask ONE question naturally, nothing else. Example: "How long have you had this symptoms?" or "On a scale of 1-10, how severe is it?"
+
+Your question:"""
+        
+        response = call_ollama(followup_prompt)
+        
+        if response and len(response) > 5:
+            question = response.strip()
+        else:
+            question = "How long have you had these symptoms and how severe are they on a scale of 1-10?"
+        
+        # Track that we asked this
+        session_data['questions_asked'] = questions_asked + [question[:50]]
+        
+        return {
+            "diagnosis_ready": False,
+            "confidence": 30 + (exchange_count * 15),
+            "response_text": question
+        }
+    
+    else:
+        # Have enough info - provide diagnosis using SAME format that worked before
+        diagnosis_prompt = f"""Patient symptoms: {symptoms}
+
+Full conversation history:
+{conversation_text}
+
+Based on this information, provide a medical assessment.
+
+IMPORTANT: Respond with EXACTLY these 5 lines in this format:
+
+DIAGNOSIS: [one sentence diagnosis based on symptoms]
+CONFIDENCE: [number between 85-95]
+URGENCY: [EMERGENCY, URGENT, or NON-URGENT]
+REMEDIES: [3 short remedies separated by commas]
+ACTIONS: [3 short actions separated by commas]
+
+Example response:
+DIAGNOSIS: Lower back muscle strain from overuse
+CONFIDENCE: 90
+URGENCY: NON-URGENT
+REMEDIES: Apply ice for 15 minutes, Rest for 2 days, Gentle stretching
+ACTIONS: Avoid heavy lifting, See doctor if persists over 1 week, Use proper posture
+
+Now provide assessment for this patient:"""
+        
+        response = call_ollama(diagnosis_prompt)
+        
+        # Parse the response - SAME PARSING LOGIC that worked before
+        if response and len(response) > 20:
+            diagnosis_match = re.search(r'DIAGNOSIS:\s*(.+?)(?=\n|$)', response, re.IGNORECASE)
+            confidence_match = re.search(r'CONFIDENCE:\s*(\d+)', response)
+            urgency_match = re.search(r'URGENCY:\s*(\w+)', response, re.IGNORECASE)
+            remedies_match = re.search(r'REMEDIES:\s*(.+?)(?=\n[A-Z]|\n\n|$)', response, re.IGNORECASE | re.DOTALL)
+            actions_match = re.search(r'ACTIONS:\s*(.+?)(?=\n\n|$)', response, re.IGNORECASE | re.DOTALL)
+            
+            if diagnosis_match and confidence_match and urgency_match:
+                diagnosis = diagnosis_match.group(1).strip()
+                confidence = int(confidence_match.group(1))
+                urgency = urgency_match.group(1).upper()
+                
+                remedies = ["Rest", "Ice/heat", "Gentle movement"]
+                if remedies_match:
+                    remedies = [r.strip() for r in remedies_match.group(1).split(',')][:3]
+                
+                actions = ["Monitor symptoms", "Rest 2-3 days", "See doctor if worsens"]
+                if actions_match:
+                    actions = [a.strip() for a in actions_match.group(1).split(',')][:3]
+                
+                return {
+                    "diagnosis_ready": True,
+                    "confidence": min(confidence, 95),
+                    "possible_diagnosis": diagnosis,
+                    "urgency": urgency,
+                    "home_remedies": remedies,
+                    "recommended_actions": actions,
+                    "red_flags": []
+                }
+        
+        # Fallback for common conditions (only if LLM fails)
+        symptom_lower = symptoms.lower()
+        if "sore throat" in symptom_lower or "stuffy" in symptom_lower:
+            return {
+                "diagnosis_ready": True,
+                "confidence": 90,
+                "possible_diagnosis": "Upper Respiratory Infection (Common Cold)",
+                "urgency": "NON-URGENT",
+                "home_remedies": ["Rest and hydrate", "Warm salt water gargle", "Steam inhalation"],
+                "recommended_actions": ["Get plenty of rest", "Use OTC cold medication", "See doctor if fever >101°F"],
+                "red_flags": []
+            }
+        elif "neck" in symptom_lower:
+            return {
+                "diagnosis_ready": True,
+                "confidence": 90,
+                "possible_diagnosis": "Acute neck muscle strain",
+                "urgency": "NON-URGENT",
+                "home_remedies": ["Apply ice for 15 minutes", "Gentle neck stretches", "Use proper posture"],
+                "recommended_actions": ["Rest from aggravating activities", "Take OTC anti-inflammatory if safe", "See doctor if numbness develops"],
+                "red_flags": []
+            }
+        else:
+            return {
+                "diagnosis_ready": True,
+                "confidence": 85,
+                "possible_diagnosis": "Musculoskeletal strain",
+                "urgency": "NON-URGENT",
+                "home_remedies": ["Rest affected area", "Apply ice or heat", "Gentle movement"],
+                "recommended_actions": ["Monitor symptoms", "Rest for 2-3 days", "See doctor if worsens"],
+                "red_flags": []
+            }
+# ================================================================
+# AUTHENTICATION ROUTES - UPDATED with demographics
 # ================================================================
 
 @login_manager.user_loader
 def load_user(user_id):
-    return User.query.get(int(user_id))
+    return db.session.get(User, int(user_id))
 
 @app.route('/')
 def index():
@@ -60,13 +281,24 @@ def register():
     if request.method == 'POST':
         email = request.form['email']
         password = request.form['password']
+        first_name = request.form.get('first_name', '')
+        last_name = request.form.get('last_name', '')
+        age = request.form.get('age', '')
+        gender = request.form.get('gender', '')
         
         if User.query.filter_by(email=email).first():
             flash('Email already registered.')
             return redirect(url_for('register'))
         
         hashed = generate_password_hash(password)
-        user = User(email=email, password_hash=hashed)
+        user = User(
+            email=email, 
+            password_hash=hashed,
+            first_name=first_name,
+            last_name=last_name,
+            age=int(age) if age else None,
+            gender=gender
+        )
         db.session.add(user)
         db.session.commit()
         
@@ -106,31 +338,123 @@ def dashboard():
 @app.route('/chat')
 @login_required
 def chat():
-    return render_template('chat.html')
+    session_id = str(uuid.uuid4())
+    user_profile = {
+        'age': current_user.age or 'Unknown',
+        'gender': current_user.gender or 'Unknown'
+    }
+    active_sessions[session_id] = {
+        'conversation': [],
+        'symptoms': '',
+        'user_profile': user_profile
+    }
+    return render_template('chat.html', session_id=session_id)
 
 # ================================================================
-# API ROUTES
+# API ROUTE
 # ================================================================
 
 @app.route('/api/analyze', methods=['POST'])
 @login_required
 def analyze():
-    """Placeholder for AI analysis - will be implemented next"""
     data = request.get_json()
     user_message = data.get('message', '')
+    session_id = data.get('session_id', '')
     
-    # Placeholder response
+    # Create session if needed
+    if session_id not in active_sessions:
+        user_profile = {
+            'age': current_user.age or 'Unknown',
+            'gender': current_user.gender or 'Unknown'
+        }
+        session_id = str(uuid.uuid4())
+        active_sessions[session_id] = {
+            'conversation': [],
+            'symptoms': user_message,
+            'user_profile': user_profile
+        }
+    
+    session_data = active_sessions[session_id]
+    user_profile = session_data.get('user_profile', {'age': 'Unknown', 'gender': 'Unknown'})
+    
+    # Add user message
+    session_data['conversation'].append({'role': 'user', 'content': user_message})
+    
+    # Get analysis with user profile
+    analysis = analyze_symptoms(session_data, user_message)
+    
+    if analysis.get('diagnosis_ready'):
+        confidence = analysis['confidence']
+        
+        response_text = f"""
+⚠️ **NOT MEDICAL ADVICE - FOR INFORMATIONAL PURPOSES ONLY**
+
+**🏥 Assessment Complete** (Confidence: {confidence}%)
+
+**📋 Possible Diagnosis:** {analysis.get('possible_diagnosis', 'Unknown')}
+
+**🚨 Urgency:** {analysis.get('urgency', 'NON-URGENT')}
+
+"""
+        if analysis.get('red_flags'):
+            response_text += "**⚠️ RED FLAGS DETECTED:**\n"
+            for flag in analysis['red_flags']:
+                response_text += f"• {flag}\n"
+            response_text += "\n"
+        
+        if analysis.get('home_remedies'):
+            response_text += "**🏠 Home Care Suggestions:**\n"
+            for remedy in analysis['home_remedies']:
+                response_text += f"• {remedy}\n"
+            response_text += "\n"
+        
+        if analysis.get('recommended_actions'):
+            response_text += "**📋 Recommended Actions:**\n"
+            for action in analysis['recommended_actions']:
+                response_text += f"• {action}\n"
+            response_text += "\n"
+        
+        if analysis.get('urgency') == 'EMERGENCY':
+            response_text = "🚨 **MEDICAL EMERGENCY DETECTED** 🚨\n\n" + response_text
+        
+        response_text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n👨‍⚕️ *Always consult a healthcare professional for medical concerns.*"
+        
+        # Save to database
+        history = MedicalHistory(
+            user_id=current_user.id,
+            session_id=session_id,
+            symptoms=session_data['symptoms'][:500],
+            conversation=json.dumps(session_data['conversation']),
+            final_conditions=json.dumps([{'name': analysis.get('possible_diagnosis', 'Unknown'), 'confidence': confidence}]),
+            urgency=analysis.get('urgency', 'NON-URGENT'),
+            confidence=confidence
+        )
+        db.session.add(history)
+        db.session.commit()
+        
+        if session_id in active_sessions:
+            del active_sessions[session_id]
+        
+        ai_response = response_text
+        assessment_ready = True
+    else:
+        ai_response = f"⚠️ NOT MEDICAL ADVICE - {analysis.get('response_text', 'Can you tell me more?')}"
+        assessment_ready = False
+    
+    session_data['conversation'].append({'role': 'bot', 'content': ai_response})
+    
     return jsonify({
-        'response': f"Received your message: '{user_message}'. AI integration coming soon!",
-        'confidence': 0,
-        'assessment_ready': False
+        'response': ai_response,
+        'confidence': analysis.get('confidence', 0) if assessment_ready else 0,
+        'urgency': analysis.get('urgency', '') if assessment_ready else '',
+        'assessment_ready': assessment_ready,
+        'session_id': session_id
     })
 
 @app.route('/api/save-assessment', methods=['POST'])
 @login_required
 def save_assessment():
     data = request.get_json()
-    
     history = MedicalHistory(
         user_id=current_user.id,
         session_id=data.get('session_id', ''),
@@ -142,20 +466,27 @@ def save_assessment():
     )
     db.session.add(history)
     db.session.commit()
-    
     return jsonify({'success': True})
-
-# ================================================================
-# MAIN
-# ================================================================
 
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
+    
     print("=" * 60)
     print("🩺 SymCheck AI - Medical Triage System")
     print("=" * 60)
-    print("\n📍 http://127.0.0.1:5000")
+    print(f"\n📍 http://127.0.0.1:5000")
+    print(f"🤖 Model: {MODEL_NAME}")
+    print(f"✅ Emergency detection: Stroke, Heart Attack")
+    print(f"✅ User demographics: Age, Gender")
+    
+    test_response = call_ollama("Say 'OK' if you're working")
+    if test_response:
+        print(f"✅ Ollama connected!")
+    else:
+        print(f"❌ Ollama not responding - run 'ollama serve' in another terminal")
+    
     print("\n⚠️ NOT MEDICAL ADVICE - For educational purposes only")
     print("\nPress Ctrl+C to stop\n")
+    
     app.run(debug=True, port=5000)
