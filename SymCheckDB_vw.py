@@ -1,141 +1,96 @@
 """
-Database Viewer for SymCheck AI
-Simple read-only script to display database contents
+SymCheck AI - Simple Database Viewer
+Run this to see all data in the database
 """
 
 import sqlite3
 import json
+import os
 
-DB_PATH = 'symcheck.db'
+# The database is in the 'instance' folder
+DB_PATH = os.path.join('instance', 'symcheck.db')
 
-def print_separator(char='=', length=80):
-    print(char * length)
+def get_diagnosis_from_json(value):
+    """Extract diagnosis name from JSON field"""
+    if not value:
+        return "N/A"
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, list) and len(parsed) > 0:
+            return parsed[0].get('name', 'Unknown')[:40]
+        elif isinstance(parsed, dict):
+            return parsed.get('name', 'Unknown')[:40]
+        else:
+            return str(value)[:40]
+    except:
+        return str(value)[:40]
 
-def view_users():
-    """Display all users"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT id, email, created_at FROM users")
-    rows = cursor.fetchall()
-    
-    print()
-    print_separator()
-    print("👤 USERS")
-    print_separator()
-    
-    if rows:
-        print(f"{'ID':<5} {'Email':<30} {'Created At':<20}")
-        print_separator('-')
-        for row in rows:
-            print(f"{row[0]:<5} {row[1]:<30} {row[2] if row[2] else 'N/A':<20}")
-    else:
-        print("No users found.")
-    
-    conn.close()
-
-def view_medical_history():
-    """Display all medical history records"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT mh.id, u.email, mh.symptoms, mh.urgency, mh.confidence, mh.created_at 
-        FROM medical_history mh
-        JOIN users u ON mh.user_id = u.id
-        ORDER BY mh.created_at DESC
-    """)
-    rows = cursor.fetchall()
-    
-    print()
-    print_separator()
-    print("🩺 MEDICAL HISTORY")
-    print_separator()
-    
-    if rows:
-        print(f"{'ID':<5} {'User':<25} {'Symptoms':<35} {'Urgency':<12} {'Confidence':<10} {'Created At':<20}")
-        print_separator('-')
-        for row in rows:
-            symptoms = (row[2][:32] + '...') if len(row[2]) > 35 else row[2]
-            confidence = f"{row[4]}%" if row[4] else 'N/A'
-            print(f"{row[0]:<5} {row[1]:<25} {symptoms:<35} {str(row[3]):<12} {confidence:<10} {row[5] if row[5] else 'N/A':<20}")
-    else:
-        print("No medical history records found.")
-    
-    conn.close()
-
-def view_detailed_history():
-    """View detailed conversation for all history records"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT mh.id, u.email, mh.symptoms, mh.conversation, mh.final_conditions, 
-               mh.urgency, mh.confidence, mh.created_at
-        FROM medical_history mh
-        JOIN users u ON mh.user_id = u.id
-        ORDER BY mh.created_at DESC
-    """)
-    rows = cursor.fetchall()
-    
-    if not rows:
-        print("\nNo history records found.")
-        conn.close()
+def view_database():
+    if not os.path.exists(DB_PATH):
+        print(f"❌ Database file not found at: {DB_PATH}")
+        print("   Please run the Flask app first to create the database.")
         return
     
-    for row in rows:
-        print()
-        print_separator()
-        print(f"📋 DETAILED HISTORY (ID: {row[0]})")
-        print_separator()
-        print(f"User: {row[1]}")
-        print(f"Symptoms: {row[2]}")
-        print(f"Urgency: {row[5]}")
-        print(f"Confidence: {row[6]}%" if row[6] else "Confidence: N/A")
-        print(f"Created: {row[7]}")
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    print("=" * 100)
+    print("🩺 SYMCHECK AI - DATABASE CONTENTS")
+    print("=" * 100)
+    print(f"📁 Database: {DB_PATH}\n")
+    
+    # Show all tables
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = cursor.fetchall()
+    
+    for table in tables:
+        table_name = table[0]
+        print(f"\n{'='*100}")
+        print(f"📋 TABLE: {table_name.upper()}")
+        print("=" * 100)
         
-        if row[3]:
-            print("\n--- Conversation ---")
-            try:
-                conversation = json.loads(row[3])
-                for msg in conversation:
-                    role = msg.get('role', 'unknown')
-                    content = msg.get('content', '')
-                    print(f"{role.upper()}: {content}")
-                    print()
-            except:
-                print(row[3][:500])
+        # Get data
+        cursor.execute(f"SELECT * FROM {table_name}")
+        rows = cursor.fetchall()
         
-        if row[4]:
-            print("\n--- Final Conditions ---")
-            try:
-                conditions = json.loads(row[4])
-                for c in conditions:
-                    name = c.get('name', 'Unknown')
-                    conf = c.get('confidence', 0)
-                    print(f"• {name} ({conf}%)")
-            except:
-                print(row[4])
+        if not rows:
+            print("(no data)")
+            continue
         
-        print_separator()
+        # Get column names
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        # For user table - simple display
+        if table_name == 'user':
+            print(f"{'ID':<5} {'Email':<35} {'First Name':<15} {'Last Name':<15} {'Age':<5} {'Gender':<10} {'Created':<20}")
+            print("-" * 105)
+            for row in rows:
+                print(f"{row[0]:<5} {str(row[1])[:33]:<35} {str(row[3] or '')[:13]:<15} {str(row[4] or '')[:13]:<15} {row[5] or '':<5} {str(row[6] or '')[:8]:<10} {str(row[7])[:19]:<20}")
+        
+        # For medical_history table - show diagnosis properly
+        elif table_name == 'medical_history':
+            print(f"{'ID':<5} {'Symptoms':<45} {'Diagnosis':<35} {'Urgency':<12} {'Confidence':<10} {'Created':<20}")
+            print("-" * 130)
+            for row in rows:
+                symptoms = (row[3][:42] + '...') if len(row[3]) > 45 else row[3]
+                diagnosis = get_diagnosis_from_json(row[5])  # final_conditions column
+                urgency = str(row[6] or 'N/A')[:10]
+                confidence = f"{row[7] or 0:.0f}%" if row[7] else "N/A"
+                created = str(row[8])[:19] if row[8] else "N/A"
+                print(f"{row[0]:<5} {symptoms:<45} {diagnosis:<35} {urgency:<12} {confidence:<10} {created:<20}")
+        
+        # For any other tables - simple display
+        else:
+            print(f"Columns: {', '.join(columns)}")
+            print("-" * 80)
+            for i, row in enumerate(rows, 1):
+                print(f"Row {i}: {dict(zip(columns, row))}")
     
     conn.close()
+    print("\n" + "=" * 100)
+    print("✅ Database view complete")
+    print("=" * 100)
 
 if __name__ == "__main__":
-    import sys
-    
-    print()
-    print_separator()
-    print("🩺 SYMCHECK AI - DATABASE VIEWER (READ ONLY)")
-    print_separator()
-    
-    if len(sys.argv) > 1 and sys.argv[1] == "--detailed":
-        view_detailed_history()
-    else:
-        view_users()
-        view_medical_history()
-        print()
-        print_separator()
-        print("💡 TIPS:")
-        print("  • View full details: python SymCheckDB.py --detailed")
-        print_separator()
+    view_database()
