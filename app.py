@@ -34,7 +34,7 @@ login_manager.login_view = 'login'
 
 # Ollama configuration
 OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "llama3.2:1b"
+MODEL_NAME = "gemma2:2b"
 CONFIDENCE_THRESHOLD = 85
 
 active_sessions = {}
@@ -234,7 +234,7 @@ Now provide assessment for this patient:"""
                 
                 return {
                     "diagnosis_ready": True,
-                    "confidence": min(confidence, 95),
+                    "confidence": min(confidence, 80),
                     "possible_diagnosis": diagnosis,
                     "urgency": urgency,
                     "home_remedies": remedies,
@@ -243,37 +243,37 @@ Now provide assessment for this patient:"""
                 }
         
         # Fallback for common conditions (only if LLM fails)
-        symptom_lower = symptoms.lower()
-        if "sore throat" in symptom_lower or "stuffy" in symptom_lower:
-            return {
-                "diagnosis_ready": True,
-                "confidence": 90,
-                "possible_diagnosis": "Upper Respiratory Infection (Common Cold)",
-                "urgency": "NON-URGENT",
-                "home_remedies": ["Rest and hydrate", "Warm salt water gargle", "Steam inhalation"],
-                "recommended_actions": ["Get plenty of rest", "Use OTC cold medication", "See doctor if fever >101°F"],
-                "red_flags": []
-            }
-        elif "neck" in symptom_lower:
-            return {
-                "diagnosis_ready": True,
-                "confidence": 90,
-                "possible_diagnosis": "Acute neck muscle strain",
-                "urgency": "NON-URGENT",
-                "home_remedies": ["Apply ice for 15 minutes", "Gentle neck stretches", "Use proper posture"],
-                "recommended_actions": ["Rest from aggravating activities", "Take OTC anti-inflammatory if safe", "See doctor if numbness develops"],
-                "red_flags": []
-            }
-        else:
-            return {
-                "diagnosis_ready": True,
-                "confidence": 85,
-                "possible_diagnosis": "Musculoskeletal strain",
-                "urgency": "NON-URGENT",
-                "home_remedies": ["Rest affected area", "Apply ice or heat", "Gentle movement"],
-                "recommended_actions": ["Monitor symptoms", "Rest for 2-3 days", "See doctor if worsens"],
-                "red_flags": []
-            }
+        #symptom_lower = symptoms.lower()
+        #if "sore throat" in symptom_lower or "stuffy" in symptom_lower:
+         #   return {
+          #      "diagnosis_ready": True,
+           #     "confidence": 90,
+            #    "possible_diagnosis": "Upper Respiratory Infection (Common Cold)",
+             #   "urgency": "NON-URGENT",
+              #  "home_remedies": ["Rest and hydrate", "Warm salt water gargle", "Steam inhalation"],
+               # "recommended_actions": ["Get plenty of rest", "Use OTC cold medication", "See doctor if fever >101°F"],
+                #"red_flags": []
+            #}
+        #elif "neck" in symptom_lower:
+         #   return {
+          #      "diagnosis_ready": True,
+           #     "confidence": 90,
+            #    "possible_diagnosis": "Acute neck muscle strain",
+             #   "urgency": "NON-URGENT",
+              #  "home_remedies": ["Apply ice for 15 minutes", "Gentle neck stretches", "Use proper posture"],
+               # "recommended_actions": ["Rest from aggravating activities", "Take OTC anti-inflammatory if safe", "See doctor if numbness develops"],
+                #"red_flags": []
+            #}
+        #else:
+         #   return {
+          #      "diagnosis_ready": True,
+           #     "confidence": 85,
+            #    "possible_diagnosis": "Musculoskeletal strain",
+             #   "urgency": "NON-URGENT",
+              #  "home_remedies": ["Rest affected area", "Apply ice or heat", "Gentle movement"],
+               # "recommended_actions": ["Monitor symptoms", "Rest for 2-3 days", "See doctor if worsens"],
+                #"red_flags": []
+            #}
 # ================================================================
 # AUTHENTICATION ROUTES
 # ================================================================
