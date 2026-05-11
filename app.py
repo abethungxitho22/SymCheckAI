@@ -12,6 +12,16 @@ import json
 import uuid
 import requests
 import re
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.lib.units import inch
+import io
+from flask import send_file
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'dev-secret-key-change-in-production'
@@ -144,7 +154,7 @@ def analyze_symptoms(session_data, user_message):
         # Early stage - need more info
         followup_prompt = f"""The patient has these symptoms: {symptoms}
 
-You act as a doctor. Your role play starts as soon as you reply. You are responsible for as successfully diagnosing this problem.
+You act as a doctor. Your role play starts as soon as you reply. You are responsible for successfully diagnosing this problem.
 Get this one hint, plus another, so think of question to get as much info as possible.  
 
 Ask ONE specific follow-up question to understand better. Ask about:
@@ -153,7 +163,7 @@ Ask ONE specific follow-up question to understand better. Ask about:
 - What makes it better or worse
 - Location and radiation of symptoms
 
-Just ask ONE question naturally, nothing else. Example: "How long have you had this symptoms?" or "On a scale of 1-10, how severe is it?"
+Just ask ONE question naturally, so you can prompt the user to give you more context so you may better diagnose, nothing else.
 
 Your question:"""
         
@@ -265,7 +275,7 @@ Now provide assessment for this patient:"""
                 "red_flags": []
             }
 # ================================================================
-# AUTHENTICATION ROUTES - UPDATED with demographics
+# AUTHENTICATION ROUTES
 # ================================================================
 
 @login_manager.user_loader
@@ -274,7 +284,7 @@ def load_user(user_id):
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return redirect(url_for('login'))
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
@@ -327,31 +337,38 @@ def login():
 @login_required
 def logout():
     logout_user()
-    return redirect(url_for('index'))
+    return redirect(url_for('login'))
 
 @app.route('/dashboard')
 @login_required
 def dashboard():
     histories = MedicalHistory.query.filter_by(user_id=current_user.id).order_by(MedicalHistory.created_at.desc()).all()
+    
+    # Parse diagnosis names for display
+    for history in histories:
+        try:
+            if history.final_conditions:
+                conditions = json.loads(history.final_conditions)
+                history.diagnosis_name = conditions[0].get('name', 'Unknown') if conditions else 'Unknown'
+            else:
+                history.diagnosis_name = 'Unknown'
+        except:
+            history.diagnosis_name = 'Unknown'
+    
     return render_template('dashboard.html', histories=histories)
 
 @app.route('/chat')
 @login_required
 def chat():
     session_id = str(uuid.uuid4())
-    user_profile = {
-        'age': current_user.age or 'Unknown',
-        'gender': current_user.gender or 'Unknown'
-    }
     active_sessions[session_id] = {
         'conversation': [],
-        'symptoms': '',
-        'user_profile': user_profile
+        'symptoms': ''
     }
     return render_template('chat.html', session_id=session_id)
 
 # ================================================================
-# API ROUTE
+# API ROUTES
 # ================================================================
 
 @app.route('/api/analyze', methods=['POST'])
@@ -363,24 +380,18 @@ def analyze():
     
     # Create session if needed
     if session_id not in active_sessions:
-        user_profile = {
-            'age': current_user.age or 'Unknown',
-            'gender': current_user.gender or 'Unknown'
-        }
         session_id = str(uuid.uuid4())
         active_sessions[session_id] = {
             'conversation': [],
-            'symptoms': user_message,
-            'user_profile': user_profile
+            'symptoms': user_message
         }
     
     session_data = active_sessions[session_id]
-    user_profile = session_data.get('user_profile', {'age': 'Unknown', 'gender': 'Unknown'})
     
     # Add user message
     session_data['conversation'].append({'role': 'user', 'content': user_message})
     
-    # Get analysis with user profile
+    # Get analysis
     analysis = analyze_symptoms(session_data, user_message)
     
     if analysis.get('diagnosis_ready'):
@@ -432,6 +443,7 @@ def analyze():
         db.session.add(history)
         db.session.commit()
         
+        # Clean up session
         if session_id in active_sessions:
             del active_sessions[session_id]
         
@@ -451,22 +463,116 @@ def analyze():
         'session_id': session_id
     })
 
-@app.route('/api/save-assessment', methods=['POST'])
+@app.route('/api/download-pdf/<int:history_id>')
 @login_required
-def save_assessment():
-    data = request.get_json()
-    history = MedicalHistory(
-        user_id=current_user.id,
-        session_id=data.get('session_id', ''),
-        symptoms=data.get('symptoms', ''),
-        conversation=json.dumps(data.get('conversation', [])),
-        final_conditions=json.dumps(data.get('conditions', [])),
-        urgency=data.get('urgency', ''),
-        confidence=data.get('confidence', 0)
+def download_pdf(history_id):
+    """Generate and download PDF diagnosis report"""
+    history = MedicalHistory.query.get_or_404(history_id)
+    
+    # Verify ownership
+    if history.user_id != current_user.id:
+        return jsonify({'error': 'Unauthorized'}), 403
+    
+    # Create PDF buffer
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = []
+    
+    # Title
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=24,
+        textColor=colors.HexColor('#1a5f7a'),
+        spaceAfter=30
     )
-    db.session.add(history)
-    db.session.commit()
-    return jsonify({'success': True})
+    story.append(Paragraph("SymCheck AI - Medical Assessment Report", title_style))
+    
+    # Patient info
+    story.append(Paragraph(f"Patient: {current_user.first_name} {current_user.last_name}", styles['Normal']))
+    story.append(Paragraph(f"Age: {current_user.age} | Gender: {current_user.gender}", styles['Normal']))
+    story.append(Paragraph(f"Date: {history.created_at.strftime('%Y-%m-%d %H:%M')}", styles['Normal']))
+    story.append(Spacer(1, 20))
+    
+    # Symptoms
+    story.append(Paragraph("Symptoms", styles['Heading2']))
+    story.append(Paragraph(history.symptoms, styles['Normal']))
+    story.append(Spacer(1, 15))
+    
+    # Diagnosis
+    try:
+        conditions = json.loads(history.final_conditions)
+        story.append(Paragraph("Diagnosis", styles['Heading2']))
+        for condition in conditions:
+            story.append(Paragraph(f"• {condition.get('name', 'Unknown')} (Confidence: {condition.get('confidence', 0)}%)", styles['Normal']))
+    except:
+        story.append(Paragraph("Diagnosis information not available", styles['Normal']))
+    story.append(Spacer(1, 15))
+    
+    # Urgency
+    urgency_color = colors.red if history.urgency == 'EMERGENCY' else (colors.orange if history.urgency == 'URGENT' else colors.green)
+    urgency_style = ParagraphStyle(
+        'Urgency',
+        parent=styles['Normal'],
+        textColor=urgency_color,
+        fontSize=14,
+        fontName='Helvetica-Bold'
+    )
+    story.append(Paragraph(f"Urgency Level: {history.urgency}", urgency_style))
+    story.append(Spacer(1, 15))
+    
+    # Disclaimer
+    disclaimer_style = ParagraphStyle(
+        'Disclaimer',
+        parent=styles['Normal'],
+        textColor=colors.grey,
+        fontSize=9,
+        alignment=1
+    )
+    story.append(Paragraph("⚠️ NOT MEDICAL ADVICE - FOR INFORMATIONAL PURPOSES ONLY", disclaimer_style))
+    story.append(Paragraph("Always consult a healthcare professional for medical concerns.", disclaimer_style))
+    
+    # Build PDF
+    doc.build(story)
+    buffer.seek(0)
+    
+    return send_file(
+        buffer,
+        as_attachment=True,
+        download_name=f"symcheck_report_{history_id}.pdf",
+        mimetype='application/pdf'
+    )
+
+@app.route('/api/dashboard-stats')
+@login_required
+def dashboard_stats():
+    """Get statistics for dashboard charts"""
+    histories = MedicalHistory.query.filter_by(user_id=current_user.id).order_by(MedicalHistory.created_at.asc()).all()
+    
+    urgency_counts = {'EMERGENCY': 0, 'URGENT': 0, 'NON-URGENT': 0}
+    
+    for h in histories:
+        if h.urgency == 'EMERGENCY':
+            urgency_counts['EMERGENCY'] += 1
+        elif h.urgency == 'URGENT':
+            urgency_counts['URGENT'] += 1
+        else:
+            urgency_counts['NON-URGENT'] += 1
+    
+    confidence_data = []
+    dates = []
+    
+    for h in histories:
+        if h.confidence:
+            confidence_data.append(h.confidence)
+            dates.append(h.created_at.strftime('%m/%d'))
+    
+    return jsonify({
+        'urgency_counts': urgency_counts,
+        'confidence_trend': {'dates': dates, 'values': confidence_data},
+        'total_assessments': len(histories)
+    })
 
 if __name__ == '__main__':
     with app.app_context():
